@@ -10,19 +10,20 @@ import (
 
 var ErrNotGranted = errors.New("access: not granted")
 
-// Token is a string which represents identifier of the fakeStream Session.
+// Token is a string which represents a namespace within which access is given.
 type Token string
 
-// Granter controls accesses between peers for data available in PlainExchange.
+// Granter controls accesses between peers and tracks the errors occurred within the token.
+// Useful when you need not only to manage access in many components but also to track the errors produced by them.
 type Granter interface {
-	// Granted checks whenever access've been given for peer with the token.
-	// and if so allows controlling exchange Session ending.
-	Granted(Token, peer.ID) (chan<- error, error)
-
-	// Grant gives access for specified peer to access data though PlainExchange
-	// and allows waiting till exchange Session is finished.
+	// Grant gives access for specified peers.
+	// Returns chan to track errors provided by the Granted.
 	// NOTE: Grant renewal on the peer with the same token removes previous grant.
 	Grant(context.Context, Token, ...peer.ID) <-chan error
+
+	// Granted checks whenever access have been given for peer within the token.
+	// On success returns chan to send errors to.
+	Granted(Token, peer.ID) (chan<- error, error)
 }
 
 // granter implements Granter.
@@ -34,24 +35,6 @@ type granter struct {
 // NewGranter creates new Granter.
 func NewGranter() Granter {
 	return &granter{grants: make(map[Token]map[peer.ID]chan error)}
-}
-
-// Granted implements Granter.Granted.
-func (g *granter) Granted(t Token, p peer.ID) (chan<- error, error) {
-	g.l.Lock()
-	defer g.l.Unlock()
-
-	tg, ok := g.grants[t]
-	if !ok {
-		return nil, NewError(p, t, ErrNotGranted)
-	}
-
-	ch, ok := tg[p]
-	if !ok {
-		return nil, NewError(p, t, ErrNotGranted)
-	}
-
-	return ch, nil
 }
 
 // Grant implements Granter.Grant.
@@ -98,19 +81,41 @@ func (g *granter) Grant(ctx context.Context, t Token, peers ...peer.ID) <-chan e
 	return out
 }
 
+// Granted implements Granter.Granted.
+func (g *granter) Granted(t Token, p peer.ID) (chan<- error, error) {
+	g.l.Lock()
+	defer g.l.Unlock()
+
+	tg, ok := g.grants[t]
+	if !ok {
+		return nil, NewError(p, t, ErrNotGranted)
+	}
+
+	ch, ok := tg[p]
+	if !ok {
+		return nil, NewError(p, t, ErrNotGranted)
+	}
+
+	return ch, nil
+}
+
+// passingGranter implements Granter which automatically allows access to everything.
 type passingGranter struct{}
 
+// NewPassingGranter builds new Granter which automatically allows access to everything.
 func NewPassingGranter() Granter {
 	return &passingGranter{}
 }
 
-func (p *passingGranter) Granted(Token, peer.ID) (chan<- error, error) {
-	ch := make(chan error, 1)
-	return ch, nil
-}
-
+// Granted implements Granter.Granted.
 func (p *passingGranter) Grant(context.Context, Token, ...peer.ID) <-chan error {
 	ch := make(chan error)
 	close(ch)
 	return ch
+}
+
+// Granted implements Granter.Granted.
+func (p *passingGranter) Granted(Token, peer.ID) (chan<- error, error) {
+	ch := make(chan error, 1)
+	return ch, nil
 }

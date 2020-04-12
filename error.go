@@ -6,6 +6,7 @@ import (
 	"github.com/libp2p/go-libp2p-core/peer"
 )
 
+// Error is used to link a peer and error within the Token.
 type Error struct {
 	Peer  peer.ID
 	Token Token
