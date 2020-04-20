@@ -48,34 +48,35 @@ func (g *granter) Grant(ctx context.Context, t Token, peers ...peer.ID) <-chan e
 		tg = g.grants[t]
 	}
 
-	out := make(chan error)
+	out := make(chan error, len(peers))
 	wg := new(sync.WaitGroup)
 	for _, p := range peers {
 		in := make(chan error)
 		wg.Add(1)
 		go func(in chan error, p peer.ID) {
-			defer wg.Done()
 			select {
 			case err := <-in:
 				if err != nil {
-					select {
-					case out <- NewError(p, t, err): // notify client with error and peer the error happened to.
-					case <-ctx.Done():
-					}
+					out <- NewError(p, t, err) // notify client with error and peer the error happened to.
 				}
 			case <-ctx.Done():
-				select {
-				case out <- NewError(p, t, ctx.Err()): // this allows checking exact peers that not finished exchange on context cancel.
-				case <-ctx.Done():
-				}
+				out <- NewError(p, t, ctx.Err()) // this allows checking exact peers that not finished exchange on context cancel.
 			}
+
+			g.l.Lock()
+			delete(tg, p)
+			g.l.Unlock()
+			wg.Done()
 		}(in, p)
 		tg[p] = in
 	}
 
 	go func() {
-		defer close(out) // closes out in case all peers are done with no errors.
 		wg.Wait()
+		close(out)
+		g.l.Lock()
+		delete(g.grants, t)
+		g.l.Unlock()
 	}()
 
 	return out
