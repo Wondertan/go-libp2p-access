@@ -9,15 +9,16 @@ import (
 )
 
 func TestHandshake(t *testing.T) {
-	tkn := Token("test")
-	ctx := WithToken(context.Background(), tkn)
+	in := Token("test")
+	ctx := WithToken(context.Background(), in)
 
 	var buf bytes.Buffer
-	WriteToken(&buf, tkn)
+	WriteToken(&buf, in)
 
-	errs, err := TakeHand(NewPassingGranter(), &buf, "peer")
+	out, errs, err := TakeHand(NewPassingGranter(), &buf, "peer")
 	require.NoError(t, err)
 	require.NotNil(t, errs)
+	require.Equal(t, in, out)
 
 	err = GiveHand(ctx, &buf)
 	require.NoError(t, err)

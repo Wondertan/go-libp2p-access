@@ -39,10 +39,10 @@ func GiveHand(ctx context.Context, s io.ReadWriter) error {
 	return nil
 }
 
-func TakeHand(g Granter, s io.ReadWriter, peer peer.ID) (chan<- error, error) {
+func TakeHand(g Granter, s io.ReadWriter, peer peer.ID) (Token, chan<- error, error) {
 	t, _, err := ReadToken(s)
 	if err != nil {
-		return nil, err
+		return "", nil, err
 	}
 
 	errs, err := g.Granted(t, peer)
@@ -50,19 +50,19 @@ func TakeHand(g Granter, s io.ReadWriter, peer peer.ID) (chan<- error, error) {
 		if err == ErrNotGranted {
 			_, err = WriteToken(s, errToken)
 			if err != nil {
-				return nil, err
+				return "", nil, err
 			}
 
-			return nil, ErrNotGranted
+			return "", nil, ErrNotGranted
 		}
 
-		return nil, err
+		return "", nil, err
 	}
 
 	_, err = WriteToken(s, t)
 	if err != nil {
-		return nil, err
+		return "", nil, err
 	}
 
-	return errs, nil
+	return t, errs, nil
 }
