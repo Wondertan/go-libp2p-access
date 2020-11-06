@@ -27,7 +27,7 @@ func TestGranterSuccess(t *testing.T) {
 	g1, err := granter.Granted(tkn, p1)
 	require.Nil(t, err)
 
-	go func() { g1 <- nil }()
+	go func() { close(g1) }()
 	select {
 	case <-ch:
 		t.Fatal("receive value before everything done")
@@ -37,10 +37,10 @@ func TestGranterSuccess(t *testing.T) {
 	g2, err := granter.Granted(tkn, p2)
 	require.Nil(t, err)
 
-	go func() { g2 <- nil }()
+	go func() { close(g2) }()
 	err, ok := <-ch
 	assert.False(t, ok)
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 }
 
 func TestGranterError(t *testing.T) {
@@ -61,14 +61,14 @@ func TestGranterError(t *testing.T) {
 	g1, err := granter.Granted(tkn, p1)
 	require.Nil(t, err)
 
-	go func() { g1 <- in }()
+	go func() { g1 <- in; close(g1) }()
 	out := <-ch
 	assert.Equal(t, NewError(p1, tkn, in), out)
 
 	g2, err := granter.Granted(tkn, p2)
 	require.Nil(t, err)
 
-	go func() { g2 <- in }()
+	go func() { g2 <- in; close(g2) }()
 	out = <-ch
 	assert.Equal(t, NewError(p2, tkn, in), out)
 
