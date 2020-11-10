@@ -2,84 +2,49 @@ package access
 
 import (
 	"context"
-	"errors"
 	"sync"
 
 	"github.com/libp2p/go-libp2p-core/peer"
 )
 
-var ErrNotGranted = errors.New("access: not granted")
-
-// Token is a string which represents a namespace within which access is given.
-type Token string
-
-// Granter controls accesses between peers and tracks the errors occurred within the token.
-// Useful when you need not only to manage access in many components but also to track the errors produced by them.
-type Granter interface {
-	// Grant gives access for specified peers.
-	// Returns chan to track errors provided by the Granted.
-	// NOTE: Grant renewal on the peer with the same token removes previous grant.
-	Grant(context.Context, Token, ...peer.ID) <-chan error
-
-	// Granted checks whenever access have been given for peer within the token.
-	// On success returns chan to send errors to.
-	Granted(Token, peer.ID) (chan<- error, error)
-}
-
 // granter implements Granter.
 type granter struct {
 	l      sync.Mutex
-	grants map[Token]map[peer.ID]chan error
+	grants map[Token]*grant
 }
 
 // NewGranter creates new Granter.
 func NewGranter() Granter {
-	return &granter{grants: make(map[Token]map[peer.ID]chan error)}
+	return &granter{grants: make(map[Token]*grant)}
 }
 
-// Grant implements Granter.Grant.
-func (g *granter) Grant(ctx context.Context, t Token, peers ...peer.ID) <-chan error {
+// Grant implements Granter.Grant
+func (g *granter) Grant(ctx context.Context, tkn Token, ps ...peer.ID) <-chan error {
 	g.l.Lock()
 	defer g.l.Unlock()
 
-	tg, ok := g.grants[t]
+	gnt, ok := g.grants[tkn]
 	if !ok {
-		g.grants[t] = make(map[peer.ID]chan error, 1)
-		tg = g.grants[t]
-	}
+		gnt = &grant{
+			tkn:   tkn,
+			out:   make(chan error, len(ps)),
+			acts:  make(chan action, 8),
+			done:  make(chan struct{}),
+			peers: make(map[peer.ID]*timedErrorHandler, len(ps)),
+		}
 
-	out := make(chan error, len(peers))
-	wg := new(sync.WaitGroup)
-	for _, p := range peers {
-		in := make(chan error)
-		wg.Add(1)
-		go func(in chan error, p peer.ID) {
-			select {
-			case err := <-in:
-				if err != nil {
-					out <- NewError(p, t, err) // notify client with error and peer the error happened to.
-				}
-			case <-ctx.Done():
-				out <- NewError(p, t, ctx.Err()) // this allows checking exact peers that not finished exchange on context cancel.
-			}
-
+		go func() {
+			gnt.handle()
 			g.l.Lock()
-			delete(tg, p)
+			delete(g.grants, tkn)
 			g.l.Unlock()
-			wg.Done()
-		}(in, p)
-		tg[p] = in
+		}()
+
+		g.grants[tkn] = gnt
 	}
 
-	go func() {
-		wg.Wait()
-		close(out)
-		g.l.Lock()
-		delete(g.grants, t)
-		g.l.Unlock()
-	}()
-
-	return out
+	gnt.GrantPeers(ctx, ps...)
+	return gnt.out
 }
 
 // Granted implements Granter.Granted.
@@ -87,36 +52,115 @@ func (g *granter) Granted(t Token, p peer.ID) (chan<- error, error) {
 	g.l.Lock()
 	defer g.l.Unlock()
 
-	tg, ok := g.grants[t]
+	gnt, ok := g.grants[t]
 	if !ok {
 		return nil, NewError(p, t, ErrNotGranted)
 	}
 
-	ch, ok := tg[p]
-	if !ok {
-		return nil, NewError(p, t, ErrNotGranted)
+	ch := gnt.PeerGranted(p)
+	if ch != nil {
+		return ch, nil
 	}
 
-	return ch, nil
+	return nil, NewError(p, t, ErrNotGranted)
 }
 
-// passingGranter implements Granter which automatically allows access to everything.
-type passingGranter struct{}
+type grant struct {
+	tkn Token
+	out chan error
 
-// NewPassingGranter builds new Granter which automatically allows access to everything.
-func NewPassingGranter() Granter {
-	return &passingGranter{}
+	acts  chan action
+	done  chan struct{}
+	peers map[peer.ID]*timedErrorHandler
 }
 
-// Granted implements Granter.Granted.
-func (p *passingGranter) Grant(context.Context, Token, ...peer.ID) <-chan error {
-	ch := make(chan error)
-	close(ch)
-	return ch
+func (g *grant) GrantPeers(ctx context.Context, ps ...peer.ID) {
+	select {
+	case g.acts <- &add{ctx: ctx, ps: ps}:
+	case <-g.done:
+	}
 }
 
-// Granted implements Granter.Granted.
-func (p *passingGranter) Granted(Token, peer.ID) (chan<- error, error) {
-	ch := make(chan error, 1)
-	return ch, nil
+func (g *grant) PeerGranted(p peer.ID) chan<- error {
+	res := make(chan chan<- error)
+	select {
+	case g.acts <- &get{p: p, res: res}:
+	case <-g.done:
+	}
+
+	select {
+	case ch := <-res:
+		return ch
+	case <-g.done:
+		return nil
+	}
+}
+
+func (g *grant) handle() {
+	defer func() {
+		close(g.done)
+		close(g.out)
+	}()
+	for {
+		select {
+		case act := <-g.acts:
+			if act.handle(g) {
+				return
+			}
+		}
+	}
+}
+
+type action interface {
+	handle(*grant) bool
+}
+
+type add struct {
+	ctx context.Context
+	ps  []peer.ID
+}
+
+func (act *add) handle(g *grant) bool {
+	for _, p := range act.ps {
+		if eh, ok := g.peers[p]; ok {
+			eh.Reset(act.ctx)
+			continue
+		}
+
+		p := p
+		eh := newTimedErrorHandler(act.ctx, func(err error) {
+			if err == eoh {
+				g.acts <- &rm{p: p}
+				return
+			}
+
+			g.out <- NewError(p, g.tkn, err)
+		}, Timeout)
+		g.peers[p] = eh
+	}
+
+	return false
+}
+
+type get struct {
+	p   peer.ID
+	res chan chan<- error
+}
+
+func (act *get) handle(g *grant) bool {
+	if eh, ok := g.peers[act.p]; ok {
+		act.res <- eh.In()
+	}
+
+	close(act.res)
+	return false
+}
+
+type rm struct {
+	p peer.ID
+}
+
+func (act *rm) handle(g *grant) bool {
+	delete(g.peers, act.p)
+	return len(g.peers) == 0
 }
